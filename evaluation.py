@@ -1,149 +1,131 @@
-import base64
-import json
-import llm_benchmarks
-import matplotlib.image as mpimg
-import matplotlib.pyplot as plt
-import numpy as np
-import openai
+"""
+Evaluate generated JSON with two judges run sequentially:
+  1) local LLaVA-Critic
+  2) OpenRouter (skipped if no API key)
+
+  python evaluation.py
+  evaluation.evaluate(api_key=...)   # OpenRouter step uses this key
+
+Use --backend local|openrouter to run a single judge only.
+Outputs: metrics/judge_details_*_{local,openrouter}.jsonl and metrics_*_{local,openrouter}.pkl
+"""
+from __future__ import annotations
+
+import argparse
 import os
-import pandas as pd
-import pickle
-from sklearn.feature_extraction.text import TfidfVectorizer
+from typing import Any, Dict, Optional
+
+from utils.evaluation_llava import (
+    generate,
+    make_openrouter_judge_fn,
+    run,
+    warmup,
+)
 
 
-def generate_response_from_image(api_key, prompt):
-    openai.api_key = api_key
+def _normalize_backend(name: str) -> str:
+    raw = name.strip().lower()
+    if raw in ("local", "llava", "llava-critic"):
+        return "local"
+    if raw in ("openrouter", "gpt", "router"):
+        return "openrouter"
+    raise ValueError(f"Unknown backend: {name!r} (use local or openrouter)")
 
-    # Obtain additional context from RAG
-    csv_path="./example_material/equipment_iso.csv"
-    rag_context = llm_benchmarks.retrieve_relevant_data(prompt, csv_path)
 
-    # Formulate context for the model
-    rag_prompt = "Use the following information about available equipment and standards:\n"
-    for item in rag_context:
-        rag_prompt += (
-            f"- Equipment: {item['Equipment category']}, "
-            f"ISO: {item['ISO']}, Name of ISO: {item['Name of ISO']}\n"
-        )
+def _common_run_kwargs() -> Dict[str, Any]:
+    only = os.getenv("EVAL_ONLY", "both").strip()
+    resume = os.getenv("EVAL_RESUME", "1").strip() not in {"0", "false", "False"}
+    return dict(
+        sleep_s=float(os.getenv("EVAL_SLEEP_S", "0.2")),
+        max_retries=int(os.getenv("EVAL_MAX_RETRIES", "2")),
+        only=only,
+        metrics_dir=os.getenv("METRICS_DIR", "metrics"),
+        batch_size=int(os.getenv("EVAL_BATCH_SIZE", "50")),
+        resume=resume,
+    )
 
-    full_prompt = prompt + "\n\n" + rag_prompt
 
+def _run_local(**run_kwargs: Any) -> None:
+    print("\n=== Judge 1/2: local LLaVA-Critic ===")
+    repo = os.getenv("HF_REPO_ID", "lmms-lab/LLaVA-Critic-R1-7B")
+    print(f"Loading model ({repo})…")
+    warmup()
+    print("Model ready.")
+
+    def judge_fn(*, prompt: str, image_path: Optional[str]) -> str:
+        return generate(prompt=prompt, image_path=image_path)
+
+    run(
+        judge_fn=judge_fn,
+        concurrency=1,
+        run_label="local",
+        row_extra={"judge_backend": "local"},
+        **run_kwargs,
+    )
+
+
+def _run_openrouter(api_key: str, **run_kwargs: Any) -> None:
+    key = api_key.strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        print("\n=== Judge 2/2: OpenRouter — skipped (no API key) ===")
+        return
+
+    print("\n=== Judge 2/2: OpenRouter ===")
+    model = os.getenv("OPENROUTER_JUDGE_MODEL", "openai/gpt-5-mini").strip()
+    if not model:
+        raise ValueError("OpenRouter: set OPENROUTER_JUDGE_MODEL.")
+
+    max_tokens_raw = os.getenv("OPENROUTER_MAX_TOKENS", "4096").strip()
+    max_tokens = int(max_tokens_raw) if max_tokens_raw else None
+    concurrency = int(os.getenv("EVAL_CONCURRENCY", "6"))
+
+    print(f"Model: {model}, concurrency={concurrency}")
+    judge_fn = make_openrouter_judge_fn(api_key=key, model=model, max_tokens=max_tokens)
+    run(
+        judge_fn=judge_fn,
+        concurrency=concurrency,
+        run_label="openrouter",
+        row_extra={"judge_backend": "openrouter", "judge_router_model": model},
+        **run_kwargs,
+    )
+
+
+def run_evaluation(*, backend: Optional[str] = None, api_key: str = "") -> None:
+    run_kwargs = _common_run_kwargs()
+
+    if backend is not None and str(backend).strip():
+        choice = _normalize_backend(str(backend))
+        if choice == "local":
+            _run_local(**run_kwargs)
+        else:
+            _run_openrouter(api_key, **run_kwargs)
+        return
+
+    _run_local(**run_kwargs)
+    _run_openrouter(api_key, **run_kwargs)
+
+
+def evaluate(api_key: str = "") -> None:
+    """Entry point for framework.py: runs local, then OpenRouter (if key is set)."""
+    run_evaluation(api_key=api_key)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Evaluate generated JSON (local LLaVA-Critic, then OpenRouter)."
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["local", "openrouter"],
+        default=None,
+        help="Run only one judge; default runs both in sequence",
+    )
+    args = parser.parse_args()
     try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": full_prompt},
-                    ],
-                }
-            ],
-            max_tokens=1000,
-        )
-
-        return response.choices[0].message.content
-    except Exception as e:
-        raise Exception(f"Error when accessing the OpenAI API: {str(e)}")
-    
-def create_prompt(reference_json, generated_json):
-    prompt = f"""
-    Evaluate the generated JSON file against the reference file based on the following criteria.
-    Respond only with a space-separated list of scores for all five criteria in the format of: 'Number Number Number Number Number' . The answer cannot contain zeros for more than two criteria.
-
-    1) File Structure (max. 100) – This criterion checks that the JSON structure fully matches the reference, including field names, nesting, and data types.
-    2) Semantic Correctness (max. 100) – This criterion evaluates whether all steps are logically ordered and semantically equivalent to those in the reference, even if worded differently.
-    3) Data Completeness (max. 100) – This criterion checks that all steps from the reference are present without omissions or unnecessary additions.
-    4) Wording Accuracy (max. 100) – This criterion assesses how closely the wording matches the reference. Minor variations such as pluralization or slight rewording (e.g., “Analyze drawing” vs. “Analyze drawings”) may be acceptable and can be assessed with a maximum rating.
-    5) ISO Standard Relevance & Consistency (max. 100) – This new criterion checks whether the ISO standards listed for each step are relevant, consistent with industry norms, and match those in the reference. Allow minor deviations only if they represent equally applicable standards.
-
-    Generated JSON file:
-    {generated_json}
-
-    Reference JSON file:
-    {reference_json}
-    """
-
-    return prompt
-
-def run_model(api_key, prompt):
-    try:
-        response = generate_response_from_image(api_key, prompt)
-        print(response)
-        return response
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
-
-def count_quality(collages_num, generated_json_path, response, results):
-    if generated_json_path.__contains__("pixtral_12b"):
-        results["Pixtral 12B"][collages_num].append(response)
-    elif generated_json_path.__contains__("qwen2_5_vl_72b"):
-        results["Qwen2.5-VL-72B"][collages_num].append(response)
-    elif generated_json_path.__contains__("qwen_vl_max"):
-        results["Qwen-VL-Max"][collages_num].append(response)
-
-def quality_assessment(data_type, api_key):
-    reference_paths = {
-        "./example_material/json_standard/json_collages_3": [
-            f"./{data_type}/json_responses/pixtral_12b/collages_3",
-            f"./{data_type}/json_responses/qwen2_5_vl_72b/collages_3",
-            f"./{data_type}/json_responses/qwen_vl_max/collages_3"
-        ],
-        "./example_material/json_standard/json_collages_4": [
-            f"./{data_type}/json_responses/pixtral_12b/collages_4",
-            f"./{data_type}/json_responses/qwen2_5_vl_72b/collages_4",
-            f"./{data_type}/json_responses/qwen_vl_max/collages_4"
-        ],
-        "./example_material/json_standard/json_collages_6": [
-            f"./{data_type}/json_responses/pixtral_12b/collages_6",
-            f"./{data_type}/json_responses/qwen2_5_vl_72b/collages_6",
-            f"./{data_type}/json_responses/qwen_vl_max/collages_6"
-        ]
-    }
-
-    results = {
-        "Pixtral 12B": {"3": [], "4": [], "6": []},
-        "Qwen2.5-VL-72B": {"3": [], "4": [], "6": []},
-        "Qwen-VL-Max": {"3": [], "4": [], "6": []},
-    }
-
-    for reference_dirpath, generated_paths in reference_paths.items():
-        for generated_dirpath in generated_paths:
-            for dirpath, dirnames, filenames in os.walk(generated_dirpath):
-                for file_path in filenames:
-                    generated_json_path = os.path.join(dirpath, file_path)
-                    part_number = file_path.split(".")[0]
-
-                    reference_json_path = os.path.join(reference_dirpath, f"{part_number}.json")
-
-                    try:
-                        with open(generated_json_path, 'r', encoding='utf-8') as file:
-                            generated_json = json.load(file)
-                        with open(reference_json_path, 'r', encoding='utf-8') as file:
-                            reference_json = json.load(file)
-
-                        prompt = create_prompt(reference_json, generated_json)
-
-                        response = run_model(api_key, prompt)
-
-                        if dirpath.endswith("3"):
-                            count_quality("3", generated_json_path, response, results)
-                        elif dirpath.endswith("4"):
-                            count_quality("4", generated_json_path, response, results)
-                        elif dirpath.endswith("6"):
-                            count_quality("6", generated_json_path, response, results)
-
-                    except Exception as e:
-                        print(f"Error:", e)
-    return results
+        run_evaluation(backend=args.backend)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
 
 
-def evaluate(api_key):
-    results_no_rag = quality_assessment('results_no_rag', api_key)
-    results_rag = quality_assessment('results_rag', api_key)
-
-    with open('./metrics/metrics_no_rag.pkl', 'wb') as f:
-        pickle.dump(results_no_rag, f)
-
-    with open('./metrics/metrics_rag.pkl', 'wb') as f:
-        pickle.dump(results_rag, f)
+if __name__ == "__main__":
+    main()

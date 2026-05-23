@@ -34,14 +34,14 @@ def load_images_from_folder(folder):
                     images.append(img_array.reshape(-1))  # <- Key change: reshape to (4096,)
                     targets.append(target)
                 except Exception as e:
-                    print(f"Ошибка при загрузке {img_path}: {e}")
+                    print(f"Error loading {img_path}: {e}")
 
         # Increment target when moving to a new subfolder
         if dirs:
             target += 1
 
     if not images:
-        raise ValueError(f"В папке {folder} не найдены изображения")
+        raise ValueError(f"No images found in folder {folder}")
 
     return np.array(images), np.array(targets), np.array(image_names)
 
@@ -126,7 +126,7 @@ def repeated(func, X, nb_iter=100, random_state=None, mode='bootstrap', **func_k
     return results
 
 def get_farthest_points(points, k):
-    """Выбирает k самых удалённых точек из массива."""
+    """Select k farthest points from the array."""
     n = points.shape[0]
     selected_indices = []
 

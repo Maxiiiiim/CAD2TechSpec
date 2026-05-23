@@ -1,0 +1,17 @@
+numpy
+pandas
+pyyaml
+pillow
+matplotlib
+scipy
+scikit-learn
+rank-bm25
+
+torch>=2.5.0
+transformers>=4.46.0
+accelerate>=0.34.0
+safetensors>=0.4.0
+
+openai
+openrouter
+mistralai
